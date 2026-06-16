@@ -142,19 +142,67 @@ runs 1 iteration (2 loads + 1 store = 3 DMAs); FREE_DIM=1000 runs 2 iterations
 ---
 
 **Q3.** Launch the GUI analytics for both *FREE_DIM = 2000* and *FREE_DIM = 1000*
-and inspect the engine timeline. *(No written answer required — observations feed
-into Q4. Optional: attach screenshots.)*
+and inspect the engine timeline (color by Instruction Type; hide individual
+NeuronCore layout and expanded DMA). On the **DMA** lane, count the DMA
+instructions — does it match the expected number of `nisa.dma_copy` calls? Also
+note the **VectorE** (the `nisa.tensor_tensor` add), **Pending DMA Count**, and
+**DMA Throughput** lanes (these feed Q4).
 
-**Answer:** _(optional observations / screenshots)_
+**Answer:**
+
+GUI launched for both profiles (clean view: DMA collapsed, no individual
+NeuronCore layout). Screenshots saved under
+[`artifacts/experiments/part1/2b/`](artifacts/experiments/part1/2b/):
+
+**FREE_DIM = 2000** (1 iteration, `total_time` ≈ 29.56 μs):
+
+![FREE_DIM=2000 engine timeline](artifacts/experiments/part1/2b/step2b_fd2000_profile.png)
+
+**FREE_DIM = 1000** (2 iterations, `total_time` ≈ 27.09 μs):
+
+![FREE_DIM=1000 engine timeline](artifacts/experiments/part1/2b/step2b_fd1000_profile.png)
+
+**DMA instruction count vs. expected `nisa.dma_copy` calls — they match.**
+`vector_add_stream` issues **3 `dma_copy` per loop iteration** (load `a_tile`,
+load `b_tile`, store `res`), and the loop runs `256000 / (128 * FREE_DIM) =
+2000 / FREE_DIM` iterations:
+
+| FREE_DIM | iterations | expected `dma_copy` (3 × iters) | profiler `dma_transfer_count` |
+|---|---|---|---|
+| 2000 | 1 | 3 | 3 ✅ |
+| 1000 | 2 | 6 | 6 ✅ |
+
+So the logical DMA-transfer count exactly equals the number of `nisa.dma_copy`
+calls. (Note: with *Show expanded DMA* on, each logical transfer is fanned out
+across the 16 DMA engines `DMA-E64…E79` as many sub-packets, so the *visual* bar
+count per engine is much larger than 3/6 — the authoritative logical count is the
+`dma_transfer_count` metric.)
+
+Other lanes: **VectorE** carries the `tensor_tensor` adds; **Pending DMA Count**
+spikes when loads are in flight; **DMA Throughput** is the key lane for Q4 — for
+FREE_DIM=2000 it shows two separated humps (load, then store) with the throughput
+dropping to **zero** in between (pure compute, no overlap), whereas for
+FREE_DIM=1000 that gap is partially filled (DMA still moving while the Vector
+Engine computes).
 
 ---
 
 **Q4.** Briefly explain why *FREE_DIM = 1000* has a faster execution time than
 *FREE_DIM = 2000* even though it required more DMA transfers. *(Hint: pipelining.)*
 
-**Answer:** _(TODO — overlap of DMA and Vector Engine; smaller tiles let the next
-DMA start while the current tile is being added, vs one giant non-overlapped
-transfer. Reference the Pending DMA Count / DMA Throughput / VectorE lanes.)_
+**Answer:** `FREE_DIM = 2000` minimizes the raw number of DMA transfers, but it
+does all of the work as one very large tile. That leaves little opportunity for
+the DMA engines and Vector Engine to overlap: the kernel must load a large tile,
+run the vector add, and then store the result, so the engine timeline has longer
+stretches where one part of the pipeline is active while the others are waiting.
+
+With `FREE_DIM = 1000`, the work is split into two smaller tiles. This doubles
+the DMA count from 3 to 6, but it gives the hardware/compiler more opportunity to
+pipeline the loop iterations: DMA for one tile can overlap with VectorE work or
+stores for another tile. In the profiler timeline this shows up as better overlap
+between the DMA lanes and the VectorE lane, with less idle time between stages.
+So even though there are more DMA instructions, the smaller tile size keeps the
+engines busier and reduces total end-to-end latency.
 
 ---
 
