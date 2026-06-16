@@ -70,9 +70,8 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     n_tiles_c_out = out_channels // c_in_pmax # number of 128-wide output-channel tiles
 
     # ------------------------------------------------------------------
-    # STEP B: any image size, no bias, no maxpool (pool_size == 1).
-    # We load only the band of input rows each output row needs, so large
-    # images (224x224) no longer overflow SBUF.
+    # STEP C: any image size, with bias, no maxpool (pool_size == 1).
+    # bias is added once per output channel, after the matmul accumulation.
     # ------------------------------------------------------------------
 
     # --- Preprocess weights into one SBUF tensor (reused by all b/rows) ---
@@ -99,6 +98,17 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                     # transpose -> (128 in, 128 out) in PSUM, then copy to SBUF slice
                     w_t = nisa.nc_transpose(w_sb)
                     w_lhsT[:, i, j, oc_t, ic_t, :] = nl.copy(w_t, dtype=W.dtype)
+
+    # --- Preprocess bias: one (128, 1) per output-channel tile, loaded once ---
+    # bias[oc] is a per-output-channel scalar; shape (128, 1) so tensor_scalar
+    # broadcasts it across all pixels of that channel.
+    bias_r = bias.reshape((out_channels, 1))
+    bias_sb = nl.ndarray((c_in_pmax, n_tiles_c_out, 1), dtype=bias.dtype, buffer=nl.sbuf)
+    for oc_t in nl.affine_range(n_tiles_c_out):
+        nisa.dma_copy(
+            src=bias_r[oc_t * c_in_pmax:(oc_t + 1) * c_in_pmax, :],
+            dst=bias_sb[:, oc_t, :],
+        )
 
     # --- Main loop: one output row at a time, loading only its input band ---
     for b in nl.affine_range(batch_size):
@@ -127,8 +137,10 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                             # row index inside the band is just i (band starts at out_row)
                             rhs = band[:, ic_t, i, j:j + out_width]
                             psum += nisa.nc_matmul(w_lhsT[:, i, j, oc_t, ic_t, :], rhs)
-                # PSUM -> SBUF (cast to output dtype), then store this row to HBM
+                # PSUM -> SBUF (cast to output dtype), add bias, then store the row.
+                # bias is added ONCE here, after the full accumulation.
                 out_sb = nl.copy(psum, dtype=X.dtype)
+                out_sb = nisa.tensor_scalar(out_sb, nl.add, bias_sb[:, oc_t, :])
                 nisa.dma_copy(
                     src=out_sb,
                     dst=X_out[b, oc_t * c_in_pmax:(oc_t + 1) * c_in_pmax, out_row, :],
