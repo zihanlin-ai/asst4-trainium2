@@ -112,73 +112,56 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
             dst=bias_sb[:, oc_t, :],
         )
 
-    if pool_size == 1:
-        # --- No pooling: one conv row -> one output row (Step C) ---
-        for b in nl.affine_range(batch_size):
-            for out_row in nl.affine_range(out_height):
-                # band = the filter_height input rows this output row needs
-                band = nl.ndarray(
-                    (c_in_pmax, n_tiles_c_in, filter_height, input_width),
-                    dtype=X.dtype, buffer=nl.sbuf,
+    # Unified structure: always process TWO conv rows per iteration. One matmul
+    # computes both rows at once via a >2D moving operand (128, 2, out_width).
+    # Branch only at the output: pool_size==1 writes both rows; ==2 maxpools them.
+    assert out_height % 2 == 0, "this kernel processes two conv rows at a time"
+    ROWS = 2                          # conv rows per iteration (= pool window height)
+    band_rows = filter_height + 1     # input rows needed for two consecutive conv rows
+    n_row_pairs = out_height // ROWS
+
+    for b in nl.affine_range(batch_size):
+        for rp in nl.affine_range(n_row_pairs):
+            # band: input rows [ROWS*rp, ROWS*rp + band_rows) across all channels
+            band = nl.ndarray(
+                (c_in_pmax, n_tiles_c_in, band_rows, input_width),
+                dtype=X.dtype, buffer=nl.sbuf,
+            )
+            for ic_t in nl.affine_range(n_tiles_c_in):
+                nisa.dma_copy(
+                    src=X[b, ic_t * c_in_pmax:(ic_t + 1) * c_in_pmax,
+                          ROWS * rp:ROWS * rp + band_rows, :],
+                    dst=band[:, ic_t, :, :],
                 )
+
+            for oc_t in nl.affine_range(n_tiles_c_out):
+                # one PSUM holding BOTH conv rows: (128 out_ch, 2, out_width)
+                psum = nl.zeros((c_in_pmax, ROWS, out_width), dtype=nl.float32, buffer=nl.psum)
                 for ic_t in nl.affine_range(n_tiles_c_in):
-                    nisa.dma_copy(
-                        src=X[b, ic_t * c_in_pmax:(ic_t + 1) * c_in_pmax,
-                              out_row:out_row + filter_height, :],
-                        dst=band[:, ic_t, :, :],
-                    )
-                for oc_t in nl.affine_range(n_tiles_c_out):
-                    psum = nl.zeros((c_in_pmax, out_width), dtype=nl.float32, buffer=nl.psum)
-                    for ic_t in nl.affine_range(n_tiles_c_in):
-                        for i in nl.affine_range(filter_height):
-                            for j in nl.affine_range(filter_width):
-                                rhs = band[:, ic_t, i, j:j + out_width]
-                                psum += nisa.nc_matmul(w_lhsT[:, i, j, oc_t, ic_t, :], rhs)
-                    out_sb = nl.copy(psum, dtype=X.dtype)
-                    out_sb = nisa.tensor_scalar(out_sb, nl.add, bias_sb[:, oc_t, :])
-                    nisa.dma_copy(
-                        src=out_sb,
-                        dst=X_out[b, oc_t * c_in_pmax:(oc_t + 1) * c_in_pmax, out_row, :],
-                    )
-    else:
-        # --- Fused 2x2 maxpool: two conv rows -> one pooled output row ---
-        band_rows = filter_height + 1  # input rows needed for conv rows 2r and 2r+1
-        for b in nl.affine_range(batch_size):
-            for r in nl.affine_range(out_pool_height):
-                band = nl.ndarray(
-                    (c_in_pmax, n_tiles_c_in, band_rows, input_width),
-                    dtype=X.dtype, buffer=nl.sbuf,
-                )
-                for ic_t in nl.affine_range(n_tiles_c_in):
-                    nisa.dma_copy(
-                        src=X[b, ic_t * c_in_pmax:(ic_t + 1) * c_in_pmax,
-                              pool_size * r:pool_size * r + band_rows, :],
-                        dst=band[:, ic_t, :, :],
-                    )
-                for oc_t in nl.affine_range(n_tiles_c_out):
-                    # two accumulators: conv row 2r (A) and 2r+1 (B)
-                    psumA = nl.zeros((c_in_pmax, out_width), dtype=nl.float32, buffer=nl.psum)
-                    psumB = nl.zeros((c_in_pmax, out_width), dtype=nl.float32, buffer=nl.psum)
-                    for ic_t in nl.affine_range(n_tiles_c_in):
-                        for i in nl.affine_range(filter_height):
-                            for j in nl.affine_range(filter_width):
-                                lhsT = w_lhsT[:, i, j, oc_t, ic_t, :]
-                                # conv row 2r   uses band row i; row 2r+1 uses band row i+1
-                                psumA += nisa.nc_matmul(lhsT, band[:, ic_t, i, j:j + out_width])
-                                psumB += nisa.nc_matmul(lhsT, band[:, ic_t, i + 1, j:j + out_width])
-                    rowA = nl.copy(psumA, dtype=X.dtype)
-                    rowB = nl.copy(psumB, dtype=X.dtype)
-                    # vertical max over the two rows
-                    vmax = nisa.tensor_tensor(rowA, rowB, op=nl.maximum)    # (128, out_width)
-                    # horizontal max over adjacent column pairs
+                    for i in nl.affine_range(filter_height):
+                        for j in nl.affine_range(filter_width):
+                            lhsT = w_lhsT[:, i, j, oc_t, ic_t, :]
+                            # >2D moving: band rows [i, i+2) -> conv rows 2rp and 2rp+1
+                            moving = band[:, ic_t, i:i + ROWS, j:j + out_width]
+                            psum += nisa.nc_matmul(lhsT, moving)   # (128, 2, out_width)
+                both = nl.copy(psum, dtype=X.dtype)                # (128, 2, out_width)
+
+                if pool_size == 1:
+                    # write the two conv rows directly (+bias each)
+                    rowA = nisa.tensor_scalar(both[:, 0, :], nl.add, bias_sb[:, oc_t, :])
+                    rowB = nisa.tensor_scalar(both[:, 1, :], nl.add, bias_sb[:, oc_t, :])
+                    nisa.dma_copy(src=rowA,
+                                  dst=X_out[b, oc_t * c_in_pmax:(oc_t + 1) * c_in_pmax, ROWS * rp, :])
+                    nisa.dma_copy(src=rowB,
+                                  dst=X_out[b, oc_t * c_in_pmax:(oc_t + 1) * c_in_pmax, ROWS * rp + 1, :])
+                else:
+                    # 2x2 maxpool: vertical max (the two rows), then horizontal (col pairs)
+                    vmax = nisa.tensor_tensor(both[:, 0, :], both[:, 1, :], op=nl.maximum)
                     vmax3 = vmax.reshape((c_in_pmax, out_pool_width, pool_size))
                     pooled = nisa.tensor_tensor(vmax3[:, :, 0], vmax3[:, :, 1], op=nl.maximum)
-                    # add bias once (max(x+b) == max(x)+b for a per-channel constant b)
                     pooled = nisa.tensor_scalar(pooled, nl.add, bias_sb[:, oc_t, :])
-                    nisa.dma_copy(
-                        src=pooled,
-                        dst=X_out[b, oc_t * c_in_pmax:(oc_t + 1) * c_in_pmax, r, :],
-                    )
+                    nisa.dma_copy(src=pooled,
+                                  dst=X_out[b, oc_t * c_in_pmax:(oc_t + 1) * c_in_pmax, rp, :])
 
     return X_out
 
