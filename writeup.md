@@ -215,9 +215,11 @@ engines busier and reduces total end-to-end latency.
 **Q1.** Test on a 1024×1024 matrix (`python run_benchmark.py --kernel transpose -n 1024`)
 and record the execution time (μs).
 
-**Answer:** _(TODO)_
+**Answer:**
 
-- `transpose`, 1024×1024 → **___ μs**
+- `transpose`, 1024×1024 → **91 μs** (correctness passed). This is the initial
+  straightforward per-tile implementation; the committed kernel is later optimized
+  in Q3 (which runs the same 1024² case in 65 μs).
 
 ---
 
@@ -226,11 +228,35 @@ compute-bound? Explain. Then confirm by profiling (as with `vector_add_stream`).
 You may include a screenshot, but provide a written description of how it validates
 your answer.
 
-**Answer:** _(TODO)_
+**Answer:**
 
-- Prediction (before profiling): **memory-bound / compute-bound** because _(TODO)_
-- Profiling evidence: _(TODO — engine utilization, DMA throughput vs Tensor Engine
-  occupancy; describe what the trace shows.)_
+- **Prediction (before profiling): memory-bound.** A transpose performs **zero
+  arithmetic (0 FLOPs)** — it only relocates elements. The whole matrix is read
+  HBM→SBUF once and written SBUF→HBM once (≈ 2× the matrix size of HBM traffic),
+  with no compute to hide that movement behind. So runtime should be limited by
+  HBM/DMA bandwidth, not engine arithmetic throughput.
+
+- **Profiling evidence (confirms memory-bound).** Profiled the 1024×1024 run
+  (`--profile_name`) and read engine activity from
+  `neuron-profile view --output-format summary-text`:
+
+  | engine | active-time % | active time |
+  |---|---|---|
+  | **DMA** | **60.9 %** (busiest) | 28.75 μs |
+  | Tensor Engine | 33.3 % | 15.73 μs |
+  | Vector Engine | 2.9 % | — |
+
+  (`total_time` ≈ 47 μs, `dma_transfer_count` = 129 ≈ 64 tiles × 2 + 1.)
+
+  The DMA engines are the most-utilized resource (≈ 61 %) and DMA active time is
+  **~2× the Tensor Engine's** — data movement dominates. Crucially, the Tensor
+  Engine's 33 % is *not* arithmetic: `nc_transpose` is a 0-FLOP data shuffle, so a
+  compute bound is impossible in principle. This matches the prediction:
+  **memory-bound.**
+
+  Side observation: `total_active_time` (33 μs) / `total_time` (47 μs) ≈ 70 %, i.e.
+  ~30 % of the time no engine is active — load/transpose/store are not fully
+  overlapped and DMA is not saturated, leaving headroom for the Q3 optimization.
 
 ---
 
@@ -238,12 +264,34 @@ your answer.
 4096×4096 transpose**. Measure *without* `--profile_name`. Submit a brief writeup
 explaining how you identified bottlenecks and addressed them.
 
-**Answer:** _(TODO if attempted)_
+**Answer:** (the committed `matrix_transpose` is this optimized version)
 
-- 4096×4096 latency (no profiler): **___ μs**
-- Bottlenecks identified: _(TODO)_
-- Optimizations applied: _(TODO — tiling strategy, DMA batching, double-buffering,
-  alternative APIs, …)_
+- **4096×4096 latency (no profiler): ≈ 683 μs** (stable: 682 / 683 / 683 over 3 runs)
+  — **under the 700 μs target ✅**, correctness passes. As a sanity check the same
+  kernel runs the 1024×1024 case in **65 μs** (vs the Q1 baseline of 91 μs).
+
+- **Bottleneck identified (from Q2):** memory-bound, and the baseline issued one
+  small `128×128` DMA per tile — `(M/128)·(N/128)` load transfers, each paying the
+  fixed per-DMA setup overhead. That overhead, plus ~30 % non-overlapped idle, was
+  the cost.
+
+- **Optimization that worked — big DMA (load batching).** Instead of one DMA per
+  `128×128` tile, load a whole input **block-row `(128, N)` in a single DMA**, then
+  transpose each `128×128` sub-tile out of that SBUF strip. This cuts the number of
+  load DMAs from `(M/128)·(N/128)` down to `M/128` (e.g. 1024 → 32 for 4096²),
+  amortizing the DMA setup overhead — the same lesson as Step 2a's `FREE_DIM`. This
+  single change took 1024² from 91 → 65 μs and brought 4096² to 683 μs.
+  (Stores stay per-tile: a transpose scatters each sub-tile to a different output
+  block-row, so the store side can't be batched the same way without strided loads.)
+
+- **Optimization that did NOT work — compiler-pipelined double-buffering.** I tried
+  removing `@nki.compiler.skip_middle_end_transformations` so the compiler could
+  pipeline the `affine_range` loop (overlap load *i+1* with transpose/store *i* =
+  automatic double-buffering, which would attack the ~30 % idle). It failed to
+  compile (`BIR verification failed`, neuronx-cc exit 70), so the decorator was kept
+  and the ~30 % bubble remains. Eliminating it would require hand-written ping-pong
+  double-buffering; big-DMA alone already clears the 700 μs target, so that was not
+  pursued.
 
 ---
 
