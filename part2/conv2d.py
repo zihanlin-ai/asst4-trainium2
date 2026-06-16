@@ -70,8 +70,9 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     n_tiles_c_out = out_channels // c_in_pmax # number of 128-wide output-channel tiles
 
     # ------------------------------------------------------------------
-    # STEP A: small image, no bias, no maxpool (pool_size == 1).
-    # The whole image fits in SBUF, so no row-banding yet.
+    # STEP B: any image size, no bias, no maxpool (pool_size == 1).
+    # We load only the band of input rows each output row needs, so large
+    # images (224x224) no longer overflow SBUF.
     # ------------------------------------------------------------------
 
     # --- Preprocess weights into one SBUF tensor (reused by all b/rows) ---
@@ -99,29 +100,32 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                     w_t = nisa.nc_transpose(w_sb)
                     w_lhsT[:, i, j, oc_t, ic_t, :] = nl.copy(w_t, dtype=W.dtype)
 
-    # --- Main loop: one output row at a time ---
+    # --- Main loop: one output row at a time, loading only its input band ---
     for b in nl.affine_range(batch_size):
-        # load the whole image X[b] into SBUF: (128 in_ch, n_ic_tiles, H, W_in)
-        x_sb = nl.ndarray(
-            (c_in_pmax, n_tiles_c_in, input_height, input_width),
-            dtype=X.dtype, buffer=nl.sbuf,
-        )
-        for ic_t in nl.affine_range(n_tiles_c_in):
-            nisa.dma_copy(
-                src=X[b, ic_t * c_in_pmax:(ic_t + 1) * c_in_pmax, :, :],
-                dst=x_sb[:, ic_t, :, :],
+        for out_row in nl.affine_range(out_height):
+            # band = the filter_height input rows this output row needs:
+            #   rows [out_row, out_row + filter_height) across all channels.
+            # Loaded once per output row, reused by every output-channel tile.
+            band = nl.ndarray(
+                (c_in_pmax, n_tiles_c_in, filter_height, input_width),
+                dtype=X.dtype, buffer=nl.sbuf,
             )
+            for ic_t in nl.affine_range(n_tiles_c_in):
+                nisa.dma_copy(
+                    src=X[b, ic_t * c_in_pmax:(ic_t + 1) * c_in_pmax,
+                          out_row:out_row + filter_height, :],
+                    dst=band[:, ic_t, :, :],
+                )
 
-        for oc_t in nl.affine_range(n_tiles_c_out):
-            for out_row in nl.affine_range(out_height):
+            for oc_t in nl.affine_range(n_tiles_c_out):
                 # accumulator for one output row: (128 out_ch, out_width) in PSUM
                 psum = nl.zeros((c_in_pmax, out_width), dtype=nl.float32, buffer=nl.psum)
                 # accumulate over input-channel tiles and all filter positions
                 for ic_t in nl.affine_range(n_tiles_c_in):
                     for i in nl.affine_range(filter_height):
                         for j in nl.affine_range(filter_width):
-                            # shifted input slice: (128 in_ch, out_width)
-                            rhs = x_sb[:, ic_t, out_row + i, j:j + out_width]
+                            # row index inside the band is just i (band starts at out_row)
+                            rhs = band[:, ic_t, i, j:j + out_width]
                             psum += nisa.nc_matmul(w_lhsT[:, i, j, oc_t, ic_t, :], rhs)
                 # PSUM -> SBUF (cast to output dtype), then store this row to HBM
                 out_sb = nl.copy(psum, dtype=X.dtype)
