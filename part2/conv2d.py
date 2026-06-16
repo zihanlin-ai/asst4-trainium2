@@ -65,14 +65,70 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     )
 
     # Various tiling dimensions (You may want to define more of them)
-    c_in_pmax = nl.tile_size.pmax
-    n_tiles_c_in = in_channels // c_in_pmax
+    c_in_pmax = nl.tile_size.pmax            # 128: partition limit
+    n_tiles_c_in = in_channels // c_in_pmax  # number of 128-wide input-channel tiles
+    n_tiles_c_out = out_channels // c_in_pmax # number of 128-wide output-channel tiles
 
-    # Process the images in batches
+    # ------------------------------------------------------------------
+    # STEP A: small image, no bias, no maxpool (pool_size == 1).
+    # The whole image fits in SBUF, so no row-banding yet.
+    # ------------------------------------------------------------------
+
+    # --- Preprocess weights into one SBUF tensor (reused by all b/rows) ---
+    # W is (out_ch, in_ch, i, j). nc_matmul computes lhsT.T @ rhs, and we want
+    #   out(out_ch, px) = W2d(out_ch, in_ch) @ X(in_ch, px),
+    # so lhsT must be W2d.T = (in_ch, out_ch). We transpose each 128x128 block.
+    # Stored as one SBUF tensor; the (i,j,oc_t,ic_t) block is a (128 in, 128 out)
+    # slice, indexed with the (symbolic) loop vars below.
+    w_lhsT = nl.ndarray(
+        (c_in_pmax, filter_height, filter_width, n_tiles_c_out, n_tiles_c_in, c_in_pmax),
+        dtype=W.dtype, buffer=nl.sbuf,
+    )
+    for i in nl.affine_range(filter_height):
+        for j in nl.affine_range(filter_width):
+            for oc_t in nl.affine_range(n_tiles_c_out):
+                for ic_t in nl.affine_range(n_tiles_c_in):
+                    # load W[oc_block, ic_block, i, j] -> (128 out, 128 in)
+                    w_sb = nl.ndarray((c_in_pmax, c_in_pmax), dtype=W.dtype, buffer=nl.sbuf)
+                    nisa.dma_copy(
+                        src=W[oc_t * c_in_pmax:(oc_t + 1) * c_in_pmax,
+                              ic_t * c_in_pmax:(ic_t + 1) * c_in_pmax, i, j],
+                        dst=w_sb,
+                    )
+                    # transpose -> (128 in, 128 out) in PSUM, then copy to SBUF slice
+                    w_t = nisa.nc_transpose(w_sb)
+                    w_lhsT[:, i, j, oc_t, ic_t, :] = nl.copy(w_t, dtype=W.dtype)
+
+    # --- Main loop: one output row at a time ---
     for b in nl.affine_range(batch_size):
-        raise RuntimeError("Please fill your implementation of computing convolution"
-                           " of X[b] with the weights W and bias b, followed by a"
-                           " maxpool and store the result in X_out[b]")
+        # load the whole image X[b] into SBUF: (128 in_ch, n_ic_tiles, H, W_in)
+        x_sb = nl.ndarray(
+            (c_in_pmax, n_tiles_c_in, input_height, input_width),
+            dtype=X.dtype, buffer=nl.sbuf,
+        )
+        for ic_t in nl.affine_range(n_tiles_c_in):
+            nisa.dma_copy(
+                src=X[b, ic_t * c_in_pmax:(ic_t + 1) * c_in_pmax, :, :],
+                dst=x_sb[:, ic_t, :, :],
+            )
+
+        for oc_t in nl.affine_range(n_tiles_c_out):
+            for out_row in nl.affine_range(out_height):
+                # accumulator for one output row: (128 out_ch, out_width) in PSUM
+                psum = nl.zeros((c_in_pmax, out_width), dtype=nl.float32, buffer=nl.psum)
+                # accumulate over input-channel tiles and all filter positions
+                for ic_t in nl.affine_range(n_tiles_c_in):
+                    for i in nl.affine_range(filter_height):
+                        for j in nl.affine_range(filter_width):
+                            # shifted input slice: (128 in_ch, out_width)
+                            rhs = x_sb[:, ic_t, out_row + i, j:j + out_width]
+                            psum += nisa.nc_matmul(w_lhsT[:, i, j, oc_t, ic_t, :], rhs)
+                # PSUM -> SBUF (cast to output dtype), then store this row to HBM
+                out_sb = nl.copy(psum, dtype=X.dtype)
+                nisa.dma_copy(
+                    src=out_sb,
+                    dst=X_out[b, oc_t * c_in_pmax:(oc_t + 1) * c_in_pmax, out_row, :],
+                )
 
     return X_out
 
