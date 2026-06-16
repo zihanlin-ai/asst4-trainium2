@@ -1,14 +1,3 @@
-# Assignment 4: Programming a Machine Learning Accelerator — Writeup
-
-> Submission note: the final hand-in must be `writeup.pdf`. Draft answers here in
-> markdown, then export to PDF before submitting (e.g. via VS Code, pandoc, or a
-> browser print-to-PDF). Code deliverables are `part1/kernels.py` (transpose) and
-> `part2/conv2d.py` (fused conv+maxpool).
->
-> Point budget for the writeup: **Part 1 Questions = 20 pts, Part 2 Questions = 10 pts.**
-
----
-
 ## Part 1: Vector Add and Matrix Transpose
 
 ### Step 1: Chunking Vectors to Parallelize Across 128 Compute Lanes (6 points)
@@ -17,9 +6,9 @@
 (`python run_benchmark.py --kernel tiled -n 25600`). What was the execution time
 in microseconds (μs)?
 
-**Answer:** _(TODO)_
+**Answer:**
 
-- `row_chunk = 1`, n = 25600 → **___ μs**
+- `row_chunk = 1`, n = 25600 → **38216 μs** (≈ 38.2 ms)
 
 ---
 
@@ -29,22 +18,43 @@ to *row_chunk = 1*? Why do you think it is faster?
 *(Hint: think of execution as loading `ROW_CHUNK` elements in parallel from HBM,
 then doing a `ROW_CHUNK`-wide vector add in SBUF.)*
 
-**Answer:** _(TODO)_
+**Answer:**
 
 | ROW_CHUNK | Time (μs) on n=25600 |
 |---|---|
-| 1 | ___ |
-| 128 | ___ |
+| 1 | 38216 |
+| 128 | 402 |
 
-- Speedup (1 → 128): **___×**
-- Why faster: _(TODO — partitions / 128 parallel lanes / fewer iterations / DMA amortization …)_
+- Speedup (1 → 128): **≈ 95×** (38216 / 402)
+- Why faster: two effects compound, both stemming from the fact that the
+  per-operation cost is roughly **fixed regardless of how much data the
+  operation touches**:
+  1. **Full 128-lane parallelism.** The Vector Engine is a 128-partition SIMD
+     unit whose lanes are clocked together, so a `tensor_scalar` add on a
+     `(128,1)` tile takes essentially the same time as on a `(1,1)` tile but
+     produces 128 results instead of 1. With `ROW_CHUNK=1`, 127 of 128 lanes
+     sit idle every instruction.
+  2. **128× fewer DMA transfers.** Each `nisa.dma_copy` pays a fixed
+     setup/descriptor overhead independent of size. `ROW_CHUNK=1` issues 25600
+     tiny DMAs (overhead-dominated); `ROW_CHUNK=128` issues only
+     `25600/128 = 200`, amortizing that overhead over 128 elements each.
+
+  This is visible in the per-iteration cost: 38216 μs / 25600 ≈ 1.49 μs per
+  iteration vs 402 μs / 200 ≈ 2.0 μs — roughly constant whether an iteration
+  processes 1 or 128 elements. So the win comes almost entirely from doing 128×
+  fewer iterations. (The speedup is ~95×, short of an ideal 128×, due to
+  residual compile/loop-control/bandwidth overheads.)
 
 ---
 
 **Q3.** Try running `vector_add_tiled` with *row_chunk = 256* on a vector size of
 25600. You should see an error. In one sentence, explain why.
 
-**Answer:** _(TODO — relate to the 128 maximum partition dimension on a NeuronCore.)_
+**Answer:** `ROW_CHUNK=256` tries to allocate an SBUF tile with 256 partitions
+(`nl.ndarray((ROW_CHUNK, 1), ..., buffer=nl.sbuf)`), but a NeuronCore's SBUF has a
+hard architectural limit of 128 partitions on the first (partition) dimension, so
+allocation fails with `ValueError: number of partitions 256 exceed architecture
+limitation of 128`.
 
 ---
 
