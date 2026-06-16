@@ -65,8 +65,8 @@ def vector_add_tiled(a_vec, b_vec):
     # Get the total number of vector rows
     M = a_vec.shape[0]
     
-    # TODO: You should modify this variable for Step 1
-    ROW_CHUNK = 1
+    # Step 1: max partition size is 128, so process 128 rows per DMA/vector op
+    ROW_CHUNK = 128
 
     # Loop over the total number of chunks, we can use affine_range
     # because there are no loop-carried dependencies
@@ -101,8 +101,9 @@ def vector_add_stream(a_vec, b_vec):
     # Get the total number of vector rows
     M = a_vec.shape[0]
 
-    # TODO: You should modify this variable for Step 2a
-    FREE_DIM = 2
+    # Step 2a: vector reshapes to (128, M/128); for M=25600 that is (128, 200),
+    # so FREE_DIM=200 loads the whole thing in one DMA per input (fewest transfers)
+    FREE_DIM = 200
 
     # The maximum size of our Partition Dimension
     PARTITION_DIM = 128
@@ -147,6 +148,21 @@ def matrix_transpose(a_tensor):
 
     assert M % tile_dim == N % tile_dim == 0, "Matrix dimensions not divisible by tile dimension!"
 
-    # TODO: Your implementation here. The only compute instruction you should use is `nisa.nc_transpose`.
+    n_row_tiles = M // tile_dim   # number of 128-row blocks
+    n_col_tiles = N // tile_dim   # number of 128-col blocks
+
+    # Input block (i, j) maps to output block (j, i). Blocks are independent, so
+    # affine_range lets the compiler pipeline load/transpose/store across tiles.
+    for i in nl.affine_range(n_row_tiles):
+        for j in nl.affine_range(n_col_tiles):
+            # 1) load the (i, j) 128x128 tile from HBM into SBUF
+            in_sb = nl.ndarray((tile_dim, tile_dim), dtype=a_tensor.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(src=a_tensor[i*tile_dim:(i+1)*tile_dim, j*tile_dim:(j+1)*tile_dim], dst=in_sb)
+            # 2) transpose on the Tensor Engine -> result lands in PSUM
+            t_psum = nisa.nc_transpose(in_sb)
+            # 3) copy PSUM -> SBUF (dma_copy cannot read PSUM directly)
+            out_sb = nisa.tensor_copy(t_psum)
+            # 4) store to the transposed block position (j, i) in HBM
+            nisa.dma_copy(src=out_sb, dst=out[j*tile_dim:(j+1)*tile_dim, i*tile_dim:(i+1)*tile_dim])
 
     return out
