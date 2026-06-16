@@ -116,20 +116,28 @@ size of 256000, saving `.neff` / `.ntff` files (`stream_256k_fd2k`,
 `stream_256k_fd1k`). *(No written answer required — this step produces the trace
 files used below.)*
 
-**Answer:** _(files generated — list filenames as a sanity check)_
+**Answer:** Four trace files generated:
 
-- _(TODO: stream_256k_fd2k.neff / .ntff, stream_256k_fd1k.neff / .ntff)_
+- `stream_256k_fd2k.neff`, `stream_256k_fd2k.ntff` (FREE_DIM = 2000)
+- `stream_256k_fd1k.neff`, `stream_256k_fd1k.ntff` (FREE_DIM = 1000)
+
+Benchmark wall-clock (from `run_benchmark.py`): FREE_DIM=2000 → 25 μs, FREE_DIM=1000 → 23 μs.
 
 ---
 
 **Q2.** Using `neuron-profile view --output-format summary-text ...`, report:
 
-**Answer:** _(TODO)_
+**Answer:**
 
 | FREE_DIM | total_time (s) | dma_transfer_count |
 |---|---|---|
-| 2000 | ___ | ___ |
-| 1000 | ___ | ___ |
+| 2000 | 2.8340789e-05 (≈ 28.3 μs) | 3 |
+| 1000 | 2.6665792e-05 (≈ 26.7 μs) | 6 |
+
+The key observation: **FREE_DIM = 1000 is faster (26.7 μs) despite issuing twice as
+many DMA transfers (6 vs 3).** DMA counts match the loop structure — FREE_DIM=2000
+runs 1 iteration (2 loads + 1 store = 3 DMAs); FREE_DIM=1000 runs 2 iterations
+(4 loads + 2 stores = 6 DMAs).
 
 ---
 
