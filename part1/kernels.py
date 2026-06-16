@@ -144,25 +144,24 @@ which only works on tiles of size <= 128x128.
 def matrix_transpose(a_tensor):
     M, N = a_tensor.shape
     out = nl.ndarray((N, M), dtype=a_tensor.dtype, buffer=nl.hbm)
-    tile_dim = nl.tile_size.pmax  # this should be 128
+    tile_dim = nl.tile_size.pmax  # 128
 
     assert M % tile_dim == N % tile_dim == 0, "Matrix dimensions not divisible by tile dimension!"
 
     n_row_tiles = M // tile_dim   # number of 128-row blocks
     n_col_tiles = N // tile_dim   # number of 128-col blocks
 
-    # Input block (i, j) maps to output block (j, i). Blocks are independent, so
-    # affine_range lets the compiler pipeline load/transpose/store across tiles.
+    # Big DMA: load a whole input block-ROW (128 x N) per outer iteration in ONE
+    # transfer, instead of one 128x128 tile per DMA -> far fewer load DMAs.
+    # Independent iterations + no skip_middle_end -> compiler pipelines (double-buffers).
     for i in nl.affine_range(n_row_tiles):
+        row_sb = nl.ndarray((tile_dim, N), dtype=a_tensor.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(src=a_tensor[i*tile_dim:(i+1)*tile_dim, :], dst=row_sb)
         for j in nl.affine_range(n_col_tiles):
-            # 1) load the (i, j) 128x128 tile from HBM into SBUF
-            in_sb = nl.ndarray((tile_dim, tile_dim), dtype=a_tensor.dtype, buffer=nl.sbuf)
-            nisa.dma_copy(src=a_tensor[i*tile_dim:(i+1)*tile_dim, j*tile_dim:(j+1)*tile_dim], dst=in_sb)
-            # 2) transpose on the Tensor Engine -> result lands in PSUM
-            t_psum = nisa.nc_transpose(in_sb)
-            # 3) copy PSUM -> SBUF (dma_copy cannot read PSUM directly)
+            # transpose the j-th 128x128 sub-tile of this row strip (-> PSUM)
+            t_psum = nisa.nc_transpose(row_sb[:, j*tile_dim:(j+1)*tile_dim])
+            # PSUM -> SBUF, then store to transposed block position (j, i)
             out_sb = nisa.tensor_copy(t_psum)
-            # 4) store to the transposed block position (j, i) in HBM
             nisa.dma_copy(src=out_sb, dst=out[j*tile_dim:(j+1)*tile_dim, i*tile_dim:(i+1)*tile_dim])
 
     return out
