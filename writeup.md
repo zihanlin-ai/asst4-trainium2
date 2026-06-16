@@ -64,10 +64,10 @@ limitation of 128`.
 vector size of 25600? How much faster is this than `vector_add_tiled` with
 *row_chunk = 128* from Step 1?
 
-**Answer:** _(TODO)_
+**Answer:**
 
-- `stream`, FREE_DIM = 2, n = 25600 → **___ μs**
-- Speedup vs `tiled` (row_chunk=128): **___×**
+- `stream`, FREE_DIM = 2, n = 25600 → **196 μs**
+- Speedup vs `tiled` (row_chunk=128, 402 μs): **≈ 2.05×** (402 / 196)
 
 ---
 
@@ -76,12 +76,36 @@ on a vector of size 25600. What value of *FREE_DIM* did you choose, and what was
 execution time (μs)? How much faster is your chosen *FREE_DIM* than *FREE_DIM = 2*?
 How much faster than `vector_add_tiled` with *row_chunk = 128*?
 
-**Answer:** _(TODO)_
+**Answer:**
 
-- Chosen FREE_DIM: **___** (reasoning: n=25600 / PARTITION_DIM=128 = 200 columns ⇒ FREE_DIM = ___ )
-- Time (μs): **___**
-- Speedup vs FREE_DIM = 2: **___×**
-- Speedup vs `tiled` row_chunk=128: **___×**
+- Chosen FREE_DIM: **200**. Reasoning: the vector is reshaped to
+  `(PARTITION_DIM, M/PARTITION_DIM) = (128, 25600/128) = (128, 200)`, so the free
+  dimension has 200 columns. Setting `FREE_DIM = 200` makes the loop run
+  `25600 / (128 * 200) = 1` iteration — the whole `(128, 200)` tile is loaded in a
+  single DMA per input, which is the minimum possible number of DMA transfers.
+  (`FREE_DIM` must divide 200, so the largest legal value is 200 itself.)
+- Time (μs): **15 μs**
+- Speedup vs FREE_DIM = 2 (196 μs): **≈ 13×** (196 / 15)
+- Speedup vs `tiled` row_chunk=128 (402 μs): **≈ 27×** (402 / 15)
+
+**Supporting sweep** (powers of two + the divisor 200; `FREE_DIM` must divide 200,
+so 16/32/64/128 are skipped — they drop the uncovered tail columns and fail
+correctness):
+
+| FREE_DIM | loop iters | time (μs) |
+|---|---|---|
+| 1 | 200 | 388 |
+| 2 | 100 | 196 |
+| 4 | 50 | 103 |
+| 8 | 25 | 57 |
+| 200 | 1 | 15 |
+
+The trend has two regimes: in the overhead-dominated region (FREE_DIM 1→8) the
+time roughly halves each time FREE_DIM doubles, i.e. time ∝ iterations ∝
+1/FREE_DIM, because runtime is dominated by per-DMA/per-instruction fixed overhead
+paid once per iteration. Past that, returns diminish (8→200 cuts iterations 25×
+but time only ~3.8×) as the cost floor shifts to the actual data movement and
+vector-add work rather than fixed overhead.
 
 ---
 
