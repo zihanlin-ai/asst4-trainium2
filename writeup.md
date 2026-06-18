@@ -304,17 +304,102 @@ explaining how you identified bottlenecks and addressed them.
 
 ### Implementation Description
 
-**Answer:** _(TODO — describe the algorithm and how convolution is mapped to matrix
-multiplication; how the loops are structured (filter h/w, tiled matmul, batching);
-which output dimension is tiled and the resulting input tile shapes; where bias and
-maxpool fuse in; any reshape/transpose of inputs and why — recall NKI's matmul
-transposes its first ("stationary") input.)_
+**Answer:**
+
+**Convolution as matrix multiplication.** Each output pixel is
+`out(oc, oh, ow) = bias(oc) + Σ_{ic,i,j} W(oc,ic,i,j) · X(ic, oh+i, ow+j)`. I split
+the `Σ` over the filter taps `(i,j)`: for a *fixed* tap, `W[:,:,i,j]` is an ordinary
+`(out_ch, in_ch)` matrix, and the corresponding shifted input slice is
+`(in_ch, pixels)`. So one filter tap contributes a single matmul
+`out(oc, px) += W2d(oc, ic) · Xshift(ic, px)`, and the full convolution is the sum
+of `filter_height · filter_width · n_tiles_c_in` such matmuls accumulated in PSUM.
+
+**Stationary transpose.** `nisa.nc_matmul(lhsT, rhs)` computes `lhsT.T @ rhs`, so to
+get `W2d(oc,ic) · X(ic,px)` the stationary operand must be `W2d.T = (in_ch, out_ch)`.
+I preprocess the weights once: load each `128×128` `(oc,ic)` block and `nc_transpose`
+it into a single SBUF tensor `w_lhsT` indexed `[ic_lane, i, j, oc_t, ic_t, oc_lane]`.
+This transpose is done one time and the result is reused across every batch and every
+output row.
+
+**Tiling.** The partition dimension is always 128 channels. There are
+`n_tiles_c_in = in_channels/128` input-channel tiles and `n_tiles_c_out =
+out_channels/128` output-channel tiles; **the output-channel dimension is the tiled
+one** — each matmul emits a `(128 out_ch, pixels)` PSUM tile for one `oc_t`.
+
+**Two conv rows per iteration (fuses the pool window).** The pool window height is 2,
+so the main loop processes **two conv output rows at once**. For each row-pair it
+loads a *band* of `band_rows = filter_height + 1` input rows (the rows both conv rows
+need) across all channels, into `band` of shape `(128, n_tiles_c_in, band_rows,
+input_width)`. The matmul's `moving` operand is **>2D**: `band[:, ic_t, i:i+2,
+j:j+out_width]` has shape `(128, 2, out_width)`, so a single `nc_matmul` produces
+**both** conv rows simultaneously, giving a PSUM tile of `(128, 2, out_width)`. The
+inner loops accumulate `ic_t × i × j = n_tiles_c_in · filter_height · filter_width`
+matmuls into that one PSUM tile.
+
+**Bias + maxpool fuse at the output (fully on-chip).** Once a `(oc_t, row-pair)` PSUM
+tile is complete I branch only at the drain:
+- `pool_size == 1`: add `bias` to each of the two rows (`tensor_scalar`), cast to the
+  output dtype, DMA both rows out.
+- `pool_size == 2`: vertical max of the two rows (`tensor_tensor`/`nl.maximum`),
+  reshape the result to `(128, out_pool_width, 2)` and take a horizontal max of the
+  column pairs, add bias, cast, DMA the single pooled row out.
+
+`bias` is reshaped to `(out_ch, 1)` and kept in **fp32** even when `X` is fp16,
+because `tensor_scalar`'s scalar immediate must be fp32.
 
 ### Optimization
 
-**Answer:** _(TODO — describe how you optimized: loop ordering for PSUM/SBUF
-locality, keeping intermediates in PSUM until a tile completes, double-buffering,
-DMA amortization, profiler-guided changes to fill Tensor Engine idle gaps, etc.)_
+**Answer:**
+
+**What I did (and why it helps):**
+1. **One-time weight transpose, reused everywhere.** The `nc_transpose` of every
+   `128×128` weight block runs once into `w_lhsT`; the main loop never re-transposes,
+   so the transpose cost is amortized across all batches and output rows.
+2. **PSUM locality — drain once per tile.** All `n_tiles_c_in · filter_h · filter_w`
+   matmuls for a `(oc_t, row-pair)` tile accumulate into a single PSUM bank, and the
+   output stage (bias / pool / cast / DMA) runs only after the tile is complete. The
+   intermediate sums never leave PSUM, so there is exactly one drain per output tile.
+3. **Two rows per matmul via a >2D moving operand.** Computing both conv rows of a
+   pool window in one `nc_matmul` (moving shape `(128, 2, out_width)`) halves the
+   number of matmul *invocations* versus a per-row formulation and lets one band load
+   feed both rows plus the entire pool window.
+4. **Band DMA amortization.** Each row-pair loads its input as `n_tiles_c_in` large
+   `(128, band_rows, input_width)` DMAs (one per channel tile) rather than a small DMA
+   per filter tap, amortizing per-DMA setup overhead — the same lesson as Part 1's
+   `FREE_DIM` / big-DMA transpose.
+
+**Profiler-guided analysis (this is the real story).** Profiling separates the two
+data types cleanly:
+
+| metric (224, no-pool) | fp32 | fp16 |
+|---|---:|---:|
+| latency | 3361 µs (**full credit**) | 1262 µs (95% tier) |
+| Tensor-Engine active | 90% | 62% |
+| Tensor-Engine **idle** | 10% (337 µs) | **37% (472 µs)** |
+| MATMUL instrs / LDWEIGHTS µs | 8028 / 1514 | 4032 / 388 |
+
+- **fp32 is compute-bound.** The compiler lowers each fp32 `nc_matmul` into **two**
+  hardware MATMULs (8028 vs fp16's 4032), and fp32 compute is slower, so the matmuls
+  run long enough to **hide** the fixed ~337 µs of per-row-pair stalls. TE is 90%
+  busy → already full credit, little to gain.
+- **fp16 is overhead-bound.** Halving the matmul work **un-masks** the
+  (dtype-independent) overhead: ~100 Tensor-idle gaps (one per output row-pair,
+  ~472 µs total), each waiting on `EVENT_SEMAPHORE` for the previous tile's PSUM to be
+  drained before the bank is reused, plus ~388 µs of per-matmul `LDWEIGHTS`.
+
+**Attempts that did *not* beat 1262 µs (and why).** I tried band chunking (one big DMA
+for many row-pairs), a multi-PSUM-bank pipeline (several tiles in flight, weight reuse
+across them), and fusing the output stage to read PSUM directly. Every variant landed
+at ~1260 µs. The reason is that the floor is the **serial matmul instruction stream**
+itself — `4032 MATMUL + 4032 LDWEIGHTS`, which is algorithmically fixed at
+`n_row_pairs · n_tiles_c_out · (n_tiles_c_in · filter_h · filter_w)` and cannot be
+reduced (im2col / by-column formulations issue the same count). The only thing that
+could fill the 472 µs of fp16 idle is **cross-iteration compiler pipelining** (overlap
+one tile's PSUM drain/DMA with the next tile's matmuls), and that is exactly what the
+required `@nki.compiler.skip_middle_end_transformations` decorator disables. Removing
+the decorator lets the compiler reorder, but it then mis-transforms the manual tiling
+and breaks correctness — so the decorator must stay. Net: fp16 sits at the 1262 µs
+overhead floor (95% credit), fp32 at full credit.
 
 ### Profiling — Achieved MFU
 
@@ -323,12 +408,21 @@ trace with `--profile <name>`, open it with
 `neuron-profile view -n <name>.neff -s <name>.ntff`, and read the **Cumulative
 Utilization** at the very end of the Estimated MFU section.
 
-**Answer:** _(TODO)_
+**Answer:** Read as the Cumulative Utilization at the last position of the Estimated
+MFU section on the 224×224 traces (equivalently `mfu_estimated_percent` from
+`neuron-profile view --output-format summary-text`, which is the same whole-kernel
+cumulative value):
 
 | Data type | Achieved MFU |
 |---|---|
-| float16 | ___ % |
-| float32 | ___ % |
+| float16 | **29.5 %** |
+| float32 | **44.1 %** |
+
+fp32 reaches a higher MFU because it is compute-bound (Tensor Engine 90% active), so
+the FLOPs the hardware performs sit close to its peak rate. fp16 is lower (29.5%)
+*despite* being faster in wall-clock, because halving the matmul work leaves the
+Tensor Engine 37% idle (per-row-pair PSUM-drain stalls + per-matmul LDWEIGHTS) — that
+idle time is FLOP-less, which drags the utilization down even though latency improves.
 
 ### Extra Credit — Smaller Images
 
@@ -337,10 +431,33 @@ smaller and larger images? If so, how would you optimize the fused convolution l
 for smaller images? *(Hint: `nisa.nc_matmul` can accept a >2D tensor as the `moving`
 argument, as long as PSUM hardware constraints are respected.)*
 
-**Answer:** _(TODO if attempted)_
+**Answer:**
 
-- MFU on smaller vs larger images: _(TODO)_
-- Approach for smaller images: _(TODO)_
+- **MFU on smaller vs larger images — yes, a large drop.** Profiling the *same*
+  kernel on a small (32×16) image vs the large (224×224) image:
+
+  | image | fp32 MFU | fp16 MFU |
+  |---|---:|---:|
+  | 224×224 (large) | 44% | 29.5% |
+  | 32×16 (small) | **2.1%** | **0.6%** |
+
+  On the small image MFU collapses by ~20×. The cause is the tiny output width
+  (`out_width = 16 − filter + 1 = 14`): the `moving` operand per matmul is only
+  `2·14 = 28` columns wide, far below the Tensor Engine's `gemm_moving_fmax = 512`.
+  Each matmul therefore does almost no useful work while still paying its full fixed
+  cost (LDWEIGHTS + instruction issue), and the profile is dominated by DMA and
+  instruction overhead (small-image fp16: TE 6% active, DMA 96%).
+
+- **How I would optimize for smaller images.** Pack **many output rows into the
+  `moving` free dimension of a single matmul** instead of just 2. `nc_matmul` accepts
+  a >2D moving operand as long as `rows · out_width ≤ gemm_moving_fmax = 512`; with
+  `out_width = 14` that allows up to `⌊512/14⌋ = 36` conv rows per matmul (vs the
+  current 2). This raises the moving operand from 28 to ~504 columns, so each
+  LDWEIGHTS/matmul-issue is amortized over ~18× more useful work, cutting the matmul
+  *count* by the same factor and lifting MFU off 0.6%. The pool/bias output stage
+  would then operate on the larger multi-row PSUM tile. *(Analysis only — I did not
+  implement a separate small-image code path; the submitted kernel uses the
+  2-rows-per-matmul large-image structure.)*
 
 ---
 
