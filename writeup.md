@@ -356,12 +356,33 @@ because `tensor_scalar`'s scalar immediate must be fp32.
    `128×128` weight block runs once into `w_lhsT`; the main loop never re-transposes,
    so the transpose cost is amortized across all batches and output rows.
 2. **Contiguous weight load (the decisive optimization).** Weights are read with one
-   big **contiguous** DMA per output-channel tile — `W[oc_block, :, :, :]` is
-   contiguous in HBM — and the per-tap `(stride filter_h·filter_w)` slicing needed for
-   each transpose happens *on-chip*. The naive version instead issued one **strided**
-   HBM DMA per `(i, j, oc_t, ic_t)` block (`filter_h·filter_w·n_tiles_c_out·n_tiles_c_in`
-   of them, each a stride-9 gather). That strided weight traffic turned out to be the
-   real bottleneck — see the analysis below.
+   big **contiguous** DMA per output-channel tile — `W[oc_block, :, :, :]` — and the
+   per-tap slicing needed for each transpose happens *on-chip*. This single change is
+   what won fp16 full credit; the mechanism is worth spelling out, because the cost was
+   invisible in the source.
+
+   `W` has shape `(out_ch, in_ch, fH, fW)` and is row-major, so
+   `offset(W[oc, ic, i, j]) = oc·(in_ch·fH·fW) + ic·(fH·fW) + i·fW + j`. With
+   `in_ch = 256, fH = fW = 3` that is `oc·2304 + ic·9 + (3i + j)`.
+
+   - **Naive (slow):** one DMA per `(i, j, oc_t, ic_t)` block, `src = W[oc0:oc0+128,
+     ic0:ic0+128, i, j]`. Fixing `i, j` collapses the last two axes, so the remaining
+     `128×128` elements are **scattered**: adjacent `ic` are `+9` apart, adjacent `oc`
+     are `+2304` apart — *no two requested elements are contiguous*. The DMA must
+     **gather** 16 384 isolated elements, paying addressing overhead per element, and it
+     does this `fH·fW·n_tiles_c_out·n_tiles_c_in = 36` times. That gather traffic was
+     ~355 µs and dominated the profile (90% DMA on the small image, 68% on large fp16).
+   - **Fixed (fast):** one DMA per oc tile, `src = W[oc0:oc0+128, :, :, :]`. Because
+     `oc` is the outermost axis, fixing an `oc` range and taking *all* of `(ic, fH, fW)`
+     is a **single contiguous run** of `128·2304` elements — a streaming DMA at full
+     bandwidth. The exact same bytes are moved, but contiguously instead of scattered.
+     The stride-`fH·fW` per-tap slicing the transpose needs is now an on-chip strided
+     read from SBUF (the Tensor Engine does this cheaply).
+
+   The transpose itself is **unchanged** (still 36 `nc_transpose` ops) — only the load
+   feeding it changed. Takeaway: a `[…, i, j]` index that collapses trailing axes
+   silently turns an innocent-looking slice into a strided gather; only the profiler
+   (DMA-bound) revealed it.
 3. **PSUM locality — drain once per tile.** All `n_tiles_c_in · filter_h · filter_w`
    matmuls for a `(oc_t, row-pair)` tile accumulate into a single PSUM bank, and the
    output stage (bias / pool / cast / DMA) runs only after the tile is complete. The
