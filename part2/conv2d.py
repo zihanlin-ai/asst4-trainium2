@@ -86,17 +86,26 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
         (c_in_pmax, filter_height, filter_width, n_tiles_c_out, n_tiles_c_in, c_in_pmax),
         dtype=W.dtype, buffer=nl.sbuf,
     )
+    # Load all weights with CONTIGUOUS DMAs: W[oc_block, :, :, :] is contiguous in
+    # HBM, so this is n_tiles_c_out big DMAs instead of one strided DMA per
+    # (i, j, oc_t, ic_t) block. The per-tap (stride-fH*fW) slicing then happens
+    # on-chip for the transpose, which is cheap. Weight DMA is the dominant cost on
+    # small images (DMA-bound); on large images it is hidden behind compute.
+    w_all = nl.ndarray(
+        (c_in_pmax, n_tiles_c_out, in_channels, filter_height, filter_width),
+        dtype=W.dtype, buffer=nl.sbuf,
+    )
+    for oc_t in nl.affine_range(n_tiles_c_out):
+        nisa.dma_copy(
+            src=W[oc_t * c_in_pmax:(oc_t + 1) * c_in_pmax, :, :, :],
+            dst=w_all[:, oc_t, :, :, :],
+        )
     for i in nl.affine_range(filter_height):
         for j in nl.affine_range(filter_width):
             for oc_t in nl.affine_range(n_tiles_c_out):
                 for ic_t in nl.affine_range(n_tiles_c_in):
-                    # load W[oc_block, ic_block, i, j] -> (128 out, 128 in)
-                    w_sb = nl.ndarray((c_in_pmax, c_in_pmax), dtype=W.dtype, buffer=nl.sbuf)
-                    nisa.dma_copy(
-                        src=W[oc_t * c_in_pmax:(oc_t + 1) * c_in_pmax,
-                              ic_t * c_in_pmax:(ic_t + 1) * c_in_pmax, i, j],
-                        dst=w_sb,
-                    )
+                    # on-chip (128 out, 128 in) view of W[oc_block, ic_block, i, j]
+                    w_sb = w_all[:, oc_t, ic_t * c_in_pmax:(ic_t + 1) * c_in_pmax, i, j]
                     # transpose -> (128 in, 128 out) in PSUM, then copy to SBUF slice
                     w_t = nisa.nc_transpose(w_sb)
                     w_lhsT[:, i, j, oc_t, ic_t, :] = nl.copy(w_t, dtype=W.dtype)
@@ -114,9 +123,66 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     # tensor_scalar requires an fp32 immediate, so keep bias in fp32 (matters for fp16 X)
     bias_sb = nl.copy(bias_in, dtype=nl.float32)
 
-    # Unified structure: always process TWO conv rows per iteration. One matmul
+    # ------------------------------------------------------------------
+    # SMALL-IMAGE PATH (Extra Credit): when the entire output of a channel
+    # tile fits in one matmul's moving free dim (and thus one PSUM bank),
+    # we don't tile by rows at all. One matmul per (oc_t, ic_t, tap)
+    # produces ALL out_height output rows at once, via a 3-D moving operand
+    # (128, out_height, out_width). For 32x16 / 3x3: 30*14 = 420 <= 512, so
+    # the whole image is loaded once and computed in n_tiles_c_in*fH*fW
+    # matmuls per oc_t (vs ~out_height/2 * that in the row-tiled path),
+    # which lifts the Tensor-Engine MFU off the small-image floor.
+    # ------------------------------------------------------------------
+    if out_height * out_width <= nl.tile_size.gemm_moving_fmax:
+        for b in nl.affine_range(batch_size):
+            # load the whole image once (all channels, all rows)
+            img = nl.ndarray(
+                (c_in_pmax, n_tiles_c_in, input_height, input_width),
+                dtype=X.dtype, buffer=nl.sbuf,
+            )
+            for ic_t in nl.affine_range(n_tiles_c_in):
+                nisa.dma_copy(
+                    src=X[b, ic_t * c_in_pmax:(ic_t + 1) * c_in_pmax, :, :],
+                    dst=img[:, ic_t, :, :],
+                )
+            for oc_t in nl.affine_range(n_tiles_c_out):
+                # one PSUM bank holds the ENTIRE output of this oc tile
+                psum = nl.zeros((c_in_pmax, out_height, out_width),
+                                dtype=nl.float32, buffer=nl.psum)
+                for ic_t in nl.affine_range(n_tiles_c_in):
+                    for i in nl.affine_range(filter_height):
+                        for j in nl.affine_range(filter_width):
+                            lhsT = w_lhsT[:, i, j, oc_t, ic_t, :]
+                            # moving row r = input row i+r -> output row r
+                            moving = img[:, ic_t, i:i + out_height, j:j + out_width]
+                            psum += nisa.nc_matmul(lhsT, moving)  # (128, out_h, out_w)
+                full = nl.copy(psum, dtype=nl.float32)
+
+                if pool_size == 1:
+                    outt = nisa.tensor_scalar(full, nl.add, bias_sb[:, oc_t, :])
+                    out = nl.copy(outt, dtype=X.dtype)
+                    nisa.dma_copy(
+                        src=out,
+                        dst=X_out[b, oc_t * c_in_pmax:(oc_t + 1) * c_in_pmax, :, :])
+                else:
+                    # 2x2 maxpool over the full output tile: vertical (row pairs)
+                    # then horizontal (col pairs), via reshape + elementwise max.
+                    v = full.reshape((c_in_pmax, out_pool_height, pool_size, out_width))
+                    vmax = nisa.tensor_tensor(v[:, :, 0, :], v[:, :, 1, :], op=nl.maximum)
+                    h = vmax.reshape((c_in_pmax, out_pool_height, out_pool_width, pool_size))
+                    pooled = nisa.tensor_tensor(h[:, :, :, 0], h[:, :, :, 1], op=nl.maximum)
+                    pooled = nisa.tensor_scalar(pooled, nl.add, bias_sb[:, oc_t, :])
+                    out = nl.copy(pooled, dtype=X.dtype)
+                    nisa.dma_copy(
+                        src=out,
+                        dst=X_out[b, oc_t * c_in_pmax:(oc_t + 1) * c_in_pmax, :, :])
+        return X_out
+
+    # ------------------------------------------------------------------
+    # LARGE-IMAGE PATH: process TWO conv rows per iteration. One matmul
     # computes both rows at once via a >2D moving operand (128, 2, out_width).
     # Branch only at the output: pool_size==1 writes both rows; ==2 maxpools them.
+    # ------------------------------------------------------------------
     assert out_height % 2 == 0, "this kernel processes two conv rows at a time"
     ROWS = 2                          # conv rows per iteration (= pool window height)
     band_rows = filter_height + 1     # input rows needed for two consecutive conv rows
