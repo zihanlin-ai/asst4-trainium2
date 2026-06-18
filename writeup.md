@@ -355,51 +355,49 @@ because `tensor_scalar`'s scalar immediate must be fp32.
 1. **One-time weight transpose, reused everywhere.** The `nc_transpose` of every
    `128×128` weight block runs once into `w_lhsT`; the main loop never re-transposes,
    so the transpose cost is amortized across all batches and output rows.
-2. **PSUM locality — drain once per tile.** All `n_tiles_c_in · filter_h · filter_w`
+2. **Contiguous weight load (the decisive optimization).** Weights are read with one
+   big **contiguous** DMA per output-channel tile — `W[oc_block, :, :, :]` is
+   contiguous in HBM — and the per-tap `(stride filter_h·filter_w)` slicing needed for
+   each transpose happens *on-chip*. The naive version instead issued one **strided**
+   HBM DMA per `(i, j, oc_t, ic_t)` block (`filter_h·filter_w·n_tiles_c_out·n_tiles_c_in`
+   of them, each a stride-9 gather). That strided weight traffic turned out to be the
+   real bottleneck — see the analysis below.
+3. **PSUM locality — drain once per tile.** All `n_tiles_c_in · filter_h · filter_w`
    matmuls for a `(oc_t, row-pair)` tile accumulate into a single PSUM bank, and the
    output stage (bias / pool / cast / DMA) runs only after the tile is complete. The
    intermediate sums never leave PSUM, so there is exactly one drain per output tile.
-3. **Two rows per matmul via a >2D moving operand.** Computing both conv rows of a
+4. **Two rows per matmul via a >2D moving operand.** Computing both conv rows of a
    pool window in one `nc_matmul` (moving shape `(128, 2, out_width)`) halves the
    number of matmul *invocations* versus a per-row formulation and lets one band load
    feed both rows plus the entire pool window.
-4. **Band DMA amortization.** Each row-pair loads its input as `n_tiles_c_in` large
+5. **Band DMA amortization.** Each row-pair loads its input as `n_tiles_c_in` large
    `(128, band_rows, input_width)` DMAs (one per channel tile) rather than a small DMA
    per filter tap, amortizing per-DMA setup overhead — the same lesson as Part 1's
    `FREE_DIM` / big-DMA transpose.
+6. **Small-image path (Extra Credit).** When `out_height·out_width ≤ gemm_moving_fmax`
+   the entire output of an oc tile fits one matmul's moving free dim and one PSUM bank,
+   so the image is loaded once and *every* output row is produced per matmul (no row
+   tiling). Detailed in the Extra Credit section.
 
-**Profiler-guided analysis (this is the real story).** Profiling separates the two
-data types cleanly:
+**Profiler-guided analysis (and a corrected conclusion).** My first working kernel hit
+full credit on **fp32** (compute-bound, Tensor Engine ~90% busy) but only the 95% tier
+on **fp16** (1262 µs vs the 1002 µs full-credit line). The fp32/fp16 asymmetry is real:
+the compiler lowers each fp32 `nc_matmul` into **two** hardware MATMULs and fp32 compute
+is slower, so on fp32 the matmuls run long enough to hide the fixed overhead, whereas
+fp16 halves the matmul work and un-masks it.
 
-| metric (224, no-pool) | fp32 | fp16 |
-|---|---:|---:|
-| latency | 3361 µs (**full credit**) | 1262 µs (95% tier) |
-| Tensor-Engine active | 90% | 62% |
-| Tensor-Engine **idle** | 10% (337 µs) | **37% (472 µs)** |
-| MATMUL instrs / LDWEIGHTS µs | 8028 / 1514 | 4032 / 388 |
-
-- **fp32 is compute-bound.** The compiler lowers each fp32 `nc_matmul` into **two**
-  hardware MATMULs (8028 vs fp16's 4032), and fp32 compute is slower, so the matmuls
-  run long enough to **hide** the fixed ~337 µs of per-row-pair stalls. TE is 90%
-  busy → already full credit, little to gain.
-- **fp16 is overhead-bound.** Halving the matmul work **un-masks** the
-  (dtype-independent) overhead: ~100 Tensor-idle gaps (one per output row-pair,
-  ~472 µs total), each waiting on `EVENT_SEMAPHORE` for the previous tile's PSUM to be
-  drained before the bank is reused, plus ~388 µs of per-matmul `LDWEIGHTS`.
-
-**Attempts that did *not* beat 1262 µs (and why).** I tried band chunking (one big DMA
-for many row-pairs), a multi-PSUM-bank pipeline (several tiles in flight, weight reuse
-across them), and fusing the output stage to read PSUM directly. Every variant landed
-at ~1260 µs. The reason is that the floor is the **serial matmul instruction stream**
-itself — `4032 MATMUL + 4032 LDWEIGHTS`, which is algorithmically fixed at
-`n_row_pairs · n_tiles_c_out · (n_tiles_c_in · filter_h · filter_w)` and cannot be
-reduced (im2col / by-column formulations issue the same count). The only thing that
-could fill the 472 µs of fp16 idle is **cross-iteration compiler pipelining** (overlap
-one tile's PSUM drain/DMA with the next tile's matmuls), and that is exactly what the
-required `@nki.compiler.skip_middle_end_transformations` decorator disables. Removing
-the decorator lets the compiler reorder, but it then mis-transforms the manual tiling
-and breaks correctness — so the decorator must stay. Net: fp16 sits at the 1262 µs
-overhead floor (95% credit), fp32 at full credit.
+I first **mis-diagnosed** that fp16 overhead as the *serial matmul instruction stream*
+(per-matmul `LDWEIGHTS` + per-row-pair PSUM-drain stalls), and concluded fp16 full
+credit would require cross-iteration compiler pipelining — which the mandatory
+`@nki.compiler.skip_middle_end_transformations` decorator disables — i.e. unreachable.
+**That was wrong.** The profile showed fp16 with **DMA ~68 % active**, and the dominant
+DMA was the **strided weight loads** (one stride-9 HBM gather per filter-tap × channel
+block), *not* the matmul stream. Replacing them with the contiguous weight load
+(optimization #2) dropped fp16 from **1262 µs → 775 µs** (under 1002 µs → full credit)
+and lifted its MFU from 29.5 % → 47.5 %, with **no pipelining and no decorator change**.
+fp32 was already compute-bound, so it was essentially unaffected (3361 → 3005 µs). The
+lesson: identify the busiest *engine* from the profile (DMA here), not the most
+conspicuous *instruction* (matmul) — both data types now get full performance credit.
 
 ### Profiling — Achieved MFU
 
@@ -413,16 +411,17 @@ MFU section on the 224×224 traces (equivalently `mfu_estimated_percent` from
 `neuron-profile view --output-format summary-text`, which is the same whole-kernel
 cumulative value):
 
-| Data type | Achieved MFU |
-|---|---|
-| float16 | **29.5 %** |
-| float32 | **44.1 %** |
+| Data type | Achieved MFU | Latency |
+|---|---|---|
+| float16 | **47.5 %** | 775 µs (full credit) |
+| float32 | **49.2 %** | 3005 µs (full credit) |
 
-fp32 reaches a higher MFU because it is compute-bound (Tensor Engine 90% active), so
-the FLOPs the hardware performs sit close to its peak rate. fp16 is lower (29.5%)
-*despite* being faster in wall-clock, because halving the matmul work leaves the
-Tensor Engine 37% idle (per-row-pair PSUM-drain stalls + per-matmul LDWEIGHTS) — that
-idle time is FLOP-less, which drags the utilization down even though latency improves.
+After the contiguous-weight-load fix the two data types sit close together (~48–49%),
+because both are now bounded by the same Tensor-Engine work rather than by weight DMA.
+fp32 is marginally higher (compute-bound, TE ~90% active). fp16, which before the fix
+was DMA-bound at 29.5% MFU, rises to 47.5% once the strided weight loads are removed —
+the un-hidden DMA was exactly the FLOP-less time that had been dragging utilization
+down. (For reference, the pre-fix kernel measured fp16 29.5% / fp32 44.1%.)
 
 ### Extra Credit — Smaller Images
 
@@ -431,33 +430,42 @@ smaller and larger images? If so, how would you optimize the fused convolution l
 for smaller images? *(Hint: `nisa.nc_matmul` can accept a >2D tensor as the `moving`
 argument, as long as PSUM hardware constraints are respected.)*
 
-**Answer:**
+**Answer:** *Implemented — the submitted kernel has a dedicated small-image path and
+passes all four EC performance tests (fp32 54 µs ≤ 110 µs, fp16 33 µs ≤ 84 µs, both
+with and without maxpool).*
 
-- **MFU on smaller vs larger images — yes, a large drop.** Profiling the *same*
-  kernel on a small (32×16) image vs the large (224×224) image:
+- **MFU on smaller vs larger images — yes, originally a ~20–50× collapse.** Profiling
+  the *first* (large-image-structured) kernel on a small (32×16) image vs the large
+  (224×224) image:
 
   | image | fp32 MFU | fp16 MFU |
   |---|---:|---:|
   | 224×224 (large) | 44% | 29.5% |
-  | 32×16 (small) | **2.1%** | **0.6%** |
+  | 32×16 (small), naive | **2.1%** | **0.6%** |
 
-  On the small image MFU collapses by ~20×. The cause is the tiny output width
-  (`out_width = 16 − filter + 1 = 14`): the `moving` operand per matmul is only
-  `2·14 = 28` columns wide, far below the Tensor Engine's `gemm_moving_fmax = 512`.
-  Each matmul therefore does almost no useful work while still paying its full fixed
-  cost (LDWEIGHTS + instruction issue), and the profile is dominated by DMA and
-  instruction overhead (small-image fp16: TE 6% active, DMA 96%).
+  Two effects compound on the small image. (1) **Tiny matmuls:** `out_width = 14`, so
+  the row-tiled `moving` operand is only `2·14 = 28` columns — far below
+  `gemm_moving_fmax = 512` — so each matmul does almost no useful work while paying its
+  full fixed `LDWEIGHTS`/issue cost. (2) **Weight DMA dominates:** with no large
+  compute to hide behind, the 36 strided weight loads make the kernel DMA-bound
+  (small-image fp16 profiled at TE 6% / DMA 96%).
 
-- **How I would optimize for smaller images.** Pack **many output rows into the
-  `moving` free dimension of a single matmul** instead of just 2. `nc_matmul` accepts
-  a >2D moving operand as long as `rows · out_width ≤ gemm_moving_fmax = 512`; with
-  `out_width = 14` that allows up to `⌊512/14⌋ = 36` conv rows per matmul (vs the
-  current 2). This raises the moving operand from 28 to ~504 columns, so each
-  LDWEIGHTS/matmul-issue is amortized over ~18× more useful work, cutting the matmul
-  *count* by the same factor and lifting MFU off 0.6%. The pool/bias output stage
-  would then operate on the larger multi-row PSUM tile. *(Analysis only — I did not
-  implement a separate small-image code path; the submitted kernel uses the
-  2-rows-per-matmul large-image structure.)*
+- **What I implemented.** Two changes (both in the submitted kernel):
+  1. **All-at-once matmul.** When `out_height·out_width ≤ gemm_moving_fmax` the whole
+     output of an oc tile fits one matmul's moving free dim *and* one PSUM bank, so the
+     small-image path packs **all `out_height` output rows into a single `(128,
+     out_height, out_width)` moving operand**. For 32×16 / 3×3 that is `30·14 = 420 ≤
+     512`, computing the full output in `n_tiles_c_in·filter_h·filter_w` matmuls per oc
+     tile (≈ 36 total) instead of ~540 in the row-tiled path. Maxpool/bias then run
+     once on the full PSUM tile (vertical then horizontal max via reshape).
+  2. **Contiguous weight load** (shared with the large path) — removing the strided
+     weight DMA that dominated the small-image profile.
+
+- **Result.** Small-image latency went from 613/543 µs (fp32/fp16) to **54 µs / 33 µs**
+  — under the 110/84 µs thresholds — and MFU rose from 2.1% → **24.2%** (fp32) and
+  0.6% → **10.2%** (fp16). MFU is still below the large-image figure because a 32×16
+  image simply has too few FLOPs to fully amortize fixed per-kernel overhead, but the
+  collapse is gone and all four EC tests pass for full credit.
 
 ---
 
