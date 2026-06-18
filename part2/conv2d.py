@@ -70,10 +70,13 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     n_tiles_c_out = out_channels // c_in_pmax # number of 128-wide output-channel tiles
 
     # ------------------------------------------------------------------
-    # STEP D: any image size, with bias, with fused maxpool (pool_size 1 or 2).
-    # pool_size == 1: write each conv row directly (Step C behaviour).
-    # pool_size == 2: compute two conv rows, max them (vertical), then max
-    #   adjacent column pairs (horizontal) -> one pooled row, all on-chip.
+    # Structure: shared weight + bias preprocessing, then one of two paths:
+    #   - SMALL-IMAGE path: whole output fits one matmul / PSUM bank -> compute
+    #     all output rows at once (Extra Credit, see below).
+    #   - LARGE-IMAGE path: tile the output two conv rows at a time.
+    # Both handle bias and fused maxpool (pool_size 1 or 2):
+    #   pool_size == 1 writes conv rows directly; == 2 takes a vertical max of
+    #   the row pair then a horizontal max of column pairs -> one pooled row.
     # ------------------------------------------------------------------
 
     # --- Preprocess weights into one SBUF tensor (reused by all b/rows) ---
