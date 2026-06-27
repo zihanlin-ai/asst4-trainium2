@@ -284,8 +284,8 @@ explaining how you identified bottlenecks and addressed them.
   (Stores stay per-tile: a transpose scatters each sub-tile to a different output
   block-row, so the store side can't be batched the same way without strided loads.)
 
-- **Optimization that did NOT work — compiler-pipelined double-buffering.** I tried
-  removing `@nki.compiler.skip_middle_end_transformations` so the compiler could
+- **Optimization that did NOT work — compiler-pipelined double-buffering.** Removing
+  `@nki.compiler.skip_middle_end_transformations` was tried so the compiler could
   pipeline the `affine_range` loop (overlap load *i+1* with transpose/store *i* =
   automatic double-buffering, which would attack the ~30 % idle). It failed to
   compile (`BIR verification failed`, neuronx-cc exit 70), so the decorator was kept
@@ -307,8 +307,8 @@ explaining how you identified bottlenecks and addressed them.
 **Answer:**
 
 **Convolution as matrix multiplication.** Each output pixel is
-`out(oc, oh, ow) = bias(oc) + Σ_{ic,i,j} W(oc,ic,i,j) · X(ic, oh+i, ow+j)`. I split
-the `Σ` over the filter taps `(i,j)`: for a *fixed* tap, `W[:,:,i,j]` is an ordinary
+`out(oc, oh, ow) = bias(oc) + Σ_{ic,i,j} W(oc,ic,i,j) · X(ic, oh+i, ow+j)`. The `Σ`
+is split over the filter taps `(i,j)`: for a *fixed* tap, `W[:,:,i,j]` is an ordinary
 `(out_ch, in_ch)` matrix, and the corresponding shifted input slice is
 `(in_ch, pixels)`. So one filter tap contributes a single matmul
 `out(oc, px) += W2d(oc, ic) · Xshift(ic, px)`, and the full convolution is the sum
@@ -316,8 +316,9 @@ of `filter_height · filter_width · n_tiles_c_in` such matmuls accumulated in P
 
 **Stationary transpose.** `nisa.nc_matmul(lhsT, rhs)` computes `lhsT.T @ rhs`, so to
 get `W2d(oc,ic) · X(ic,px)` the stationary operand must be `W2d.T = (in_ch, out_ch)`.
-I preprocess the weights once: load each `128×128` `(oc,ic)` block and `nc_transpose`
-it into a single SBUF tensor `w_lhsT` indexed `[ic_lane, i, j, oc_t, ic_t, oc_lane]`.
+The weights are preprocessed once: each `128×128` `(oc,ic)` block is loaded and
+`nc_transpose`d into a single SBUF tensor `w_lhsT` indexed
+`[ic_lane, i, j, oc_t, ic_t, oc_lane]`.
 This transpose is done one time and the result is reused across every batch and every
 output row.
 
@@ -337,7 +338,7 @@ inner loops accumulate `ic_t × i × j = n_tiles_c_in · filter_height · filter
 matmuls into that one PSUM tile.
 
 **Bias + maxpool fuse at the output (fully on-chip).** Once a `(oc_t, row-pair)` PSUM
-tile is complete I branch only at the drain:
+tile is complete the kernel branches only at the drain:
 - `pool_size == 1`: add `bias` to each of the two rows (`tensor_scalar`), cast to the
   output dtype, DMA both rows out.
 - `pool_size == 2`: vertical max of the two rows (`tensor_tensor`/`nl.maximum`),
@@ -351,7 +352,7 @@ because `tensor_scalar`'s scalar immediate must be fp32.
 
 **Answer:**
 
-**What I did (and why it helps):**
+**What was done (and why it helps):**
 1. **One-time weight transpose, reused everywhere.** The `nc_transpose` of every
    `128×128` weight block runs once into `w_lhsT`; the main loop never re-transposes,
    so the transpose cost is amortized across all batches and output rows.
@@ -400,16 +401,16 @@ because `tensor_scalar`'s scalar immediate must be fp32.
    so the image is loaded once and *every* output row is produced per matmul (no row
    tiling). Detailed in the Extra Credit section.
 
-**Profiler-guided analysis (and a corrected conclusion).** My first working kernel hit
+**Profiler-guided analysis (and a corrected conclusion).** The first working kernel hit
 full credit on **fp32** (compute-bound, Tensor Engine ~90% busy) but only the 95% tier
 on **fp16** (1262 µs vs the 1002 µs full-credit line). The fp32/fp16 asymmetry is real:
 the compiler lowers each fp32 `nc_matmul` into **two** hardware MATMULs and fp32 compute
 is slower, so on fp32 the matmuls run long enough to hide the fixed overhead, whereas
 fp16 halves the matmul work and un-masks it.
 
-I first **mis-diagnosed** that fp16 overhead as the *serial matmul instruction stream*
-(per-matmul `LDWEIGHTS` + per-row-pair PSUM-drain stalls), and concluded fp16 full
-credit would require cross-iteration compiler pipelining — which the mandatory
+That fp16 overhead was first **mis-diagnosed** as the *serial matmul instruction stream*
+(per-matmul `LDWEIGHTS` + per-row-pair PSUM-drain stalls), leading to the conclusion that
+fp16 full credit would require cross-iteration compiler pipelining — which the mandatory
 `@nki.compiler.skip_middle_end_transformations` decorator disables — i.e. unreachable.
 **That was wrong.** The profile showed fp16 with **DMA ~68 % active**, and the dominant
 DMA was the **strided weight loads** (one stride-9 HBM gather per filter-tap × channel
@@ -471,7 +472,7 @@ with and without maxpool).*
   compute to hide behind, the 36 strided weight loads make the kernel DMA-bound
   (small-image fp16 profiled at TE 6% / DMA 96%).
 
-- **What I implemented.** Two changes (both in the submitted kernel):
+- **What was implemented.** Two changes (both in the submitted kernel):
   1. **All-at-once matmul.** When `out_height·out_width ≤ gemm_moving_fmax` the whole
      output of an oc tile fits one matmul's moving free dim *and* one PSUM bank, so the
      small-image path packs **all `out_height` output rows into a single `(128,
